@@ -1,0 +1,63 @@
+# «Почтальон» отзывов: раз в 15 минут забирает новые отзывы с сервера игры и отправляет их в Телеграм.
+# Нужен потому, что из российского облака Телеграм недоступен, а с серверов GitHub — доступен.
+# Секреты (Settings → Secrets and variables → Actions): TELEGRAM_BOT_TOKEN, FEEDBACK_CHAT_ID, FEEDBACK_RELAY_KEY.
+# Тексты отзывов в журнал задачи не пишутся (журнал публичного репозитория виден всем).
+name: Отзывы в Телеграм
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: feedback-relay
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Забрать отзывы и отправить в Телеграм
+        env:
+          API: https://d5dgcit1lmddqu3o6rnk.s183zexc.apigw.yandexcloud.net
+          RELAY_KEY: ${{ secrets.FEEDBACK_RELAY_KEY }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.FEEDBACK_CHAT_ID }}
+        run: |
+          node --input-type=module <<'JS'
+          const { API, RELAY_KEY, BOT_TOKEN, CHAT_ID } = process.env
+          if (!RELAY_KEY || !BOT_TOKEN || !CHAT_ID) {
+            console.log('Секреты ещё не заданы — пропускаю.')
+            process.exit(0)
+          }
+          const headers = { 'x-relay-key': RELAY_KEY }
+          const pull = await fetch(`${API}/api/health?feedback=pull`, { headers })
+          if (!pull.ok) {
+            console.log(`Сервер игры ответил ${pull.status} — проверьте FEEDBACK_RELAY_KEY в GitHub и в функции room-api.`)
+            process.exit(1)
+          }
+          const { items = [] } = await pull.json()
+          const done = []
+          for (const it of items) {
+            const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ chat_id: CHAT_ID, text: it.text, disable_web_page_preview: true }),
+            })
+            if (r.ok) done.push(it.id)
+            else {
+              const d = await r.json().catch(() => ({}))
+              console.log(`Телеграм ответил ${r.status}: ${d.description ?? ''}`)
+              break
+            }
+          }
+          if (done.length) {
+            const ack = await fetch(`${API}/api/health?feedback=ack&ids=${encodeURIComponent(done.join(','))}`, { headers })
+            console.log(`Отметил доставленные: ${ack.status}`)
+          }
+          console.log(`Отправлено ${done.length} из ${items.length}.`)
+          if (done.length < items.length) process.exit(1)
+          JS
